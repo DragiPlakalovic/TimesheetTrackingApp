@@ -1,4 +1,4 @@
-"""Minimal REST server example (Flask, in-memory storage).
+"""
  
 Install:  pip install flask
 Run:      python simple_rest_server.py

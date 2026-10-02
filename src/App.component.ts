@@ -5,7 +5,9 @@ import {
   ReactiveFormsModule, ValidationErrors, Validators,
 } from '@angular/forms';
 import { JsonPipe } from '@angular/common';
-import { startWith } from 'rxjs';
+import { HttpErrorResponse } from '@angular/common/http';
+import { finalize, startWith } from 'rxjs';
+import { Timesheet, TimesheetResponse, TimesheetService } from './timesheet.service';
 
 const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
 type Day = (typeof DAYS)[number];
@@ -98,14 +100,20 @@ function mondayOfThisWeek(): string {
 
         <div class="actions">
           <button type="button" class="ghost" (click)="addRow()">Add row</button>
-          <button type="submit" class="primary">Submit timesheet</button>
+          <button type="submit" class="primary" [disabled]="saving()">
+            {{ saving() ? 'Submitting…' : 'Submit timesheet' }}
+          </button>
         </div>
       </form>
 
-      @if (submitted(); as payload) {
+      @if (error(); as message) {
+        <p class="err" role="alert">{{ message }}</p>
+      }
+
+      @if (submitted(); as saved) {
         <section class="result">
-          <h2>Submitted</h2>
-          <pre>{{ payload | json }}</pre>
+          <h2>Timesheet submitted (ID {{ saved.id }})</h2>
+          <pre>{{ saved | json }}</pre>
         </section>
       }
     </main>
@@ -145,6 +153,7 @@ function mondayOfThisWeek(): string {
 })
 export class AppComponent {
   private fb = inject(FormBuilder);
+  private api = inject(TimesheetService);
   readonly days = DAYS;
 
   form = this.fb.group(
@@ -156,7 +165,9 @@ export class AppComponent {
     { validators: dailyLimit },
   );
 
-  submitted = signal<unknown | null>(null);
+  submitted = signal<TimesheetResponse | null>(null);
+  saving = signal(false);
+  error = signal<string | null>(null);
 
   // Live snapshot of the form so totals recompute on every keystroke.
   private value = toSignal(this.form.valueChanges.pipe(startWith(this.form.getRawValue())), {
@@ -195,11 +206,33 @@ export class AppComponent {
   }
 
   submit() {
+    this.error.set(null);
+    this.submitted.set(null);
+
     if (this.form.invalid) {
       this.form.markAllAsTouched();
-      this.submitted.set(null);
       return;
     }
-    this.submitted.set({ ...this.form.getRawValue(), totalHours: this.grandTotal() });
+
+    const payload: Timesheet = {
+      ...(this.form.getRawValue() as Omit<Timesheet, 'totalHours'>),
+      totalHours: this.grandTotal(),
+    };
+
+    this.saving.set(true);
+    this.api
+      .submit(payload)
+      .pipe(finalize(() => this.saving.set(false)))
+      .subscribe({
+        next: res => this.submitted.set(res),
+        error: (err: HttpErrorResponse) =>
+          this.error.set(
+            err.status === 0
+              ? "Can't reach the server. Check your connection and try again."
+              : err.status === 400 || err.status === 422
+                ? err.error?.message ?? 'The server rejected this timesheet. Check the entries and try again.'
+                : 'Something went wrong while saving. Try again in a moment.',
+          ),
+      });
   }
 }
