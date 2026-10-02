@@ -1,28 +1,46 @@
 import { Component, computed, inject, signal } from '@angular/core';
 import { toSignal } from '@angular/core/rxjs-interop';
 import {
-  AbstractControl, FormArray, FormBuilder, FormControl, FormGroup,
-  ReactiveFormsModule, ValidationErrors, Validators,
+  FormArray, FormBuilder, FormGroup,
+  ReactiveFormsModule, Validators,
 } from '@angular/forms';
 import { JsonPipe } from '@angular/common';
 import { HttpErrorResponse } from '@angular/common/http';
 import { finalize, startWith } from 'rxjs';
-import { Timesheet, TimesheetResponse, TimesheetService } from './timesheet.service';
+import {
+  CreateEntryRequest,
+  SubmitWeekRequest,
+  Timesheet,
+  TimesheetService,
+  User,
+} from './timesheet.service';
 
-const DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const;
-type Day = (typeof DAYS)[number];
-
-/** Form-level validator: no day may exceed 24 hours across all rows. */
-function dailyLimit(group: AbstractControl): ValidationErrors | null {
-  const rows = (group.get('entries') as FormArray).getRawValue() as Record<Day, number>[];
-  const over = DAYS.filter(d => rows.reduce((sum, r) => sum + (+r[d] || 0), 0) > 24);
-  return over.length ? { dailyLimit: over } : null;
-}
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const;
 
 function mondayOfThisWeek(): string {
   const d = new Date();
   d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
-  return d.toISOString().slice(0, 10);
+  return toIsoDate(d);
+}
+
+function toIsoDate(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function addDays(iso: string, n: number): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  return toIsoDate(new Date(y, m - 1, d + n));
+}
+
+function apiError(err: HttpErrorResponse): string {
+  if (err.status === 0) {
+    return "Can't reach the server. Check your connection and try again.";
+  }
+  const message = typeof err.error?.error === 'string' ? err.error.error : null;
+  if (err.status === 400 || err.status === 409 || err.status === 422) {
+    return message ?? 'The server rejected this request. Check the fields and try again.';
+  }
+  return message ?? 'Something went wrong. Try again in a moment.';
 }
 
 @Component({
@@ -33,17 +51,46 @@ function mondayOfThisWeek(): string {
     <main>
       <h1>Weekly timesheet</h1>
 
+      <section class="panel">
+        <h2>Create user</h2>
+        <p class="hint">POSTs <code>{{ '{' }} "name", "email" {{ '}' }}</code> to <code>/users</code>.</p>
+        <form class="meta" [formGroup]="userForm" (ngSubmit)="createUser()">
+          <label>
+            Name
+            <input formControlName="name" autocomplete="name" />
+          </label>
+          <label>
+            Email
+            <input type="email" formControlName="email" autocomplete="email" />
+          </label>
+          <div class="field-action">
+            <button type="submit" class="ghost" [disabled]="creatingUser()">
+              {{ creatingUser() ? 'Creating…' : 'Create user' }}
+            </button>
+          </div>
+        </form>
+      </section>
+
       <form [formGroup]="form" (ngSubmit)="submit()" novalidate>
         <div class="meta">
           <label>
-            Employee name
-            <input formControlName="employee" autocomplete="name" />
-            @if (show('employee')) { <small class="err">Enter your name.</small> }
+            User
+            <select formControlName="user_id">
+              <option [ngValue]="null">Select a user</option>
+              @for (u of users(); track u.id) {
+                <option [ngValue]="u.id">{{ u.name }} ({{ u.email }}) — id {{ u.id }}</option>
+              }
+            </select>
+            @if (show('user_id')) { <small class="err">Choose a user.</small> }
           </label>
           <label>
-            Week starting (Monday)
-            <input type="date" formControlName="weekStarting" />
-            @if (show('weekStarting')) { <small class="err">Choose a date.</small> }
+            Period start (Monday)
+            <input type="date" formControlName="period_start" />
+            @if (show('period_start')) { <small class="err">Choose a date.</small> }
+          </label>
+          <label>
+            Period end
+            <input type="date" [value]="periodEnd()" disabled />
           </label>
         </div>
 
@@ -51,42 +98,32 @@ function mondayOfThisWeek(): string {
           <table>
             <thead>
               <tr>
-                <th>Project</th>
-                <th>Task</th>
-                @for (d of days; track d) { <th class="num">{{ d }}</th> }
-                <th class="num">Total</th>
-                <th></th>
+                <th>Day</th>
+                <th>work_date</th>
+                <th class="num">hours</th>
+                <th>description</th>
               </tr>
             </thead>
             <tbody>
               @for (row of entries.controls; track row; let i = $index) {
                 <tr [formGroupName]="i">
-                  <td>
-                    <input formControlName="project" placeholder="Project" aria-label="Project"
-                           [class.invalid]="row.get('project')?.touched && row.get('project')?.invalid" />
+                  <td>{{ days[i] }}</td>
+                  <td><input type="date" [value]="row.get('work_date')?.value" disabled /></td>
+                  <td class="num">
+                    <input type="number" step="0.25" min="0" max="24" formControlName="hours"
+                           [attr.aria-label]="days[i] + ' hours'"
+                           [class.invalid]="row.get('hours')?.invalid" />
                   </td>
-                  <td><input formControlName="task" placeholder="What you worked on" aria-label="Task" /></td>
-                  @for (d of days; track d) {
-                    <td class="num">
-                      <input type="number" step="0.25" min="0" max="24" [formControlName]="d"
-                             [attr.aria-label]="d + ' hours'"
-                             [class.invalid]="row.get(d)?.invalid" />
-                    </td>
-                  }
-                  <td class="num total">{{ rowTotals()[i] }}</td>
                   <td>
-                    <button type="button" class="ghost" (click)="removeRow(i)"
-                            [disabled]="entries.length === 1" aria-label="Remove row">Remove</button>
+                    <input formControlName="description" placeholder="What you worked on"
+                           aria-label="Description" />
                   </td>
                 </tr>
               }
             </tbody>
             <tfoot>
               <tr>
-                <td colspan="2">Daily total</td>
-                @for (d of days; track d) {
-                  <td class="num" [class.over]="dayTotals()[d] > 24">{{ dayTotals()[d] }}</td>
-                }
+                <td colspan="2">total_hours</td>
                 <td class="num total">{{ grandTotal() }}</td>
                 <td></td>
               </tr>
@@ -94,12 +131,7 @@ function mondayOfThisWeek(): string {
           </table>
         </div>
 
-        @if (form.errors?.['dailyLimit']) {
-          <p class="err">A single day can't exceed 24 hours. Check: {{ form.errors?.['dailyLimit'].join(', ') }}.</p>
-        }
-
         <div class="actions">
-          <button type="button" class="ghost" (click)="addRow()">Add row</button>
           <button type="submit" class="primary" [disabled]="saving()">
             {{ saving() ? 'Submitting…' : 'Submit timesheet' }}
           </button>
@@ -110,9 +142,16 @@ function mondayOfThisWeek(): string {
         <p class="err" role="alert">{{ message }}</p>
       }
 
+      @if (createdUser(); as user) {
+        <section class="result">
+          <h2>User created</h2>
+          <pre>{{ user | json }}</pre>
+        </section>
+      }
+
       @if (submitted(); as saved) {
         <section class="result">
-          <h2>Timesheet submitted (ID {{ saved.id }})</h2>
+          <h2>Timesheet {{ saved.status }} (ID {{ saved.id }})</h2>
           <pre>{{ saved | json }}</pre>
         </section>
       }
@@ -124,25 +163,28 @@ function mondayOfThisWeek(): string {
             font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
     main { max-width: 1040px; margin: 0 auto; padding: 2rem 1rem 4rem; }
     h1 { font-size: 1.75rem; margin: 0 0 1.5rem; letter-spacing: -0.01em; }
-    h2 { font-size: 1.1rem; }
+    h2 { font-size: 1.1rem; margin: 0 0 .5rem; }
+    .hint { color: var(--muted); margin: 0 0 1rem; font-size: .9rem; }
+    code { font-size: .85em; }
+    .panel { background:#fff; border:1px solid var(--line); border-radius:8px; padding:1rem 1.25rem; margin-bottom:1.5rem; }
     .meta { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
     label { display:flex; flex-direction:column; gap:.25rem; font-weight:600; font-size:.9rem; }
-    input { font:inherit; padding:.45rem .55rem; border:1px solid var(--line); border-radius:6px; background:#fff; color:inherit; width:100%; box-sizing:border-box; }
-    input:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+    input, select { font:inherit; padding:.45rem .55rem; border:1px solid var(--line); border-radius:6px; background:#fff; color:inherit; width:100%; box-sizing:border-box; }
+    input:disabled { background:#f8f9fb; color:var(--muted); }
+    input:focus-visible, select:focus-visible, button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
     input.invalid { border-color: var(--bad); }
+    .field-action { display:flex; align-items:flex-end; }
     .grid { overflow-x:auto; background:#fff; border:1px solid var(--line); border-radius:8px; }
-    table { border-collapse:collapse; width:100%; min-width:860px; }
+    table { border-collapse:collapse; width:100%; min-width:640px; }
     th, td { padding:.4rem .5rem; text-align:left; border-bottom:1px solid var(--line); }
-    th { font-size:.8rem; color:var(--muted); text-transform:capitalize; font-weight:600; }
-    .num { text-align:right; width:64px; }
+    th { font-size:.8rem; color:var(--muted); font-weight:600; }
+    .num { text-align:right; width:88px; }
     td.num input { text-align:right; padding-inline:.3rem; }
-    td:nth-child(1) { width:170px; } td:nth-child(2) { min-width:200px; }
     .total { font-weight:700; font-variant-numeric: tabular-nums; }
     tfoot td { font-weight:600; border-bottom:0; background:#f8f9fb; font-variant-numeric: tabular-nums; }
-    tfoot .over { color:var(--bad); }
     .err { color:var(--bad); font-weight:500; }
     small.err { font-size:.8rem; }
-    .actions { display:flex; justify-content:space-between; margin-top:1.25rem; }
+    .actions { display:flex; justify-content:flex-end; margin-top:1.25rem; }
     button { font:inherit; padding:.55rem 1rem; border-radius:6px; cursor:pointer; border:1px solid var(--line); background:#fff; color:inherit; }
     button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
     button.ghost { color:var(--muted); }
@@ -156,53 +198,103 @@ export class AppComponent {
   private api = inject(TimesheetService);
   readonly days = DAYS;
 
-  form = this.fb.group(
-    {
-      employee: ['', [Validators.required, Validators.minLength(2)]],
-      weekStarting: [mondayOfThisWeek(), Validators.required],
-      entries: this.fb.array([this.newRow()]),
-    },
-    { validators: dailyLimit },
-  );
+  userForm = this.fb.nonNullable.group({
+    name: ['', [Validators.required, Validators.minLength(2)]],
+    email: ['', [Validators.required, Validators.email]],
+  });
 
-  submitted = signal<TimesheetResponse | null>(null);
+  form = this.fb.group({
+    user_id: this.fb.control<number | null>(null, Validators.required),
+    period_start: [mondayOfThisWeek(), Validators.required],
+    entries: this.fb.array(this.buildWeek(mondayOfThisWeek())),
+  });
+
+  users = signal<User[]>([]);
+  createdUser = signal<User | null>(null);
+  submitted = signal<Timesheet | null>(null);
   saving = signal(false);
+  creatingUser = signal(false);
   error = signal<string | null>(null);
 
-  // Live snapshot of the form so totals recompute on every keystroke.
   private value = toSignal(this.form.valueChanges.pipe(startWith(this.form.getRawValue())), {
     initialValue: this.form.getRawValue(),
   });
 
-  private rows = computed(() => (this.value().entries ?? []) as Partial<Record<Day, number>>[]);
-
-  rowTotals = computed(() => this.rows().map(r => DAYS.reduce((s, d) => s + (+(r[d] ?? 0) || 0), 0)));
-  dayTotals = computed(() => {
-    const out = {} as Record<Day, number>;
-    for (const d of DAYS) out[d] = this.rows().reduce((s, r) => s + (+(r[d] ?? 0) || 0), 0);
-    return out;
+  periodEnd = computed(() => {
+    const start = this.value().period_start;
+    return start ? addDays(start, 6) : '';
   });
-  grandTotal = computed(() => this.rowTotals().reduce((a, b) => a + b, 0));
+
+  grandTotal = computed(() =>
+    (this.value().entries ?? []).reduce((sum, row) => sum + (+(row?.hours ?? 0) || 0), 0),
+  );
 
   get entries(): FormArray<FormGroup> {
     return this.form.get('entries') as FormArray<FormGroup>;
   }
 
-  private newRow(): FormGroup {
-    const hours = () => new FormControl(0, { nonNullable: true, validators: [Validators.min(0), Validators.max(24)] });
-    return this.fb.group({
-      project: ['', Validators.required],
-      task: [''],
-      mon: hours(), tue: hours(), wed: hours(), thu: hours(), fri: hours(), sat: hours(), sun: hours(),
+  constructor() {
+    this.form.get('period_start')?.valueChanges.subscribe(start => {
+      if (start) this.replaceWeek(start);
+    });
+    this.refreshUsers();
+  }
+
+  private buildWeek(periodStart: string): FormGroup[] {
+    return DAYS.map((_, i) =>
+      this.fb.group({
+        work_date: [addDays(periodStart, i)],
+        hours: [0, [Validators.min(0), Validators.max(24)]],
+        description: [''],
+      }),
+    );
+  }
+
+  private replaceWeek(periodStart: string) {
+    const previous = this.entries.getRawValue() as CreateEntryRequest[];
+    this.entries.clear();
+    this.buildWeek(periodStart).forEach((row, i) => {
+      row.patchValue({
+        hours: previous[i]?.hours ?? 0,
+        description: previous[i]?.description ?? '',
+      });
+      this.entries.push(row);
     });
   }
 
-  addRow() { this.entries.push(this.newRow()); }
-  removeRow(i: number) { if (this.entries.length > 1) this.entries.removeAt(i); }
+  private refreshUsers(selectId?: number) {
+    this.api.listUsers().subscribe({
+      next: page => {
+        this.users.set(page.items);
+        if (selectId != null) this.form.patchValue({ user_id: selectId });
+      },
+      error: (err: HttpErrorResponse) => this.error.set(apiError(err)),
+    });
+  }
 
   show(name: string) {
     const c = this.form.get(name);
     return !!c && c.invalid && (c.touched || c.dirty);
+  }
+
+  createUser() {
+    this.error.set(null);
+    this.createdUser.set(null);
+    if (this.userForm.invalid) {
+      this.userForm.markAllAsTouched();
+      return;
+    }
+    this.creatingUser.set(true);
+    this.api
+      .createUser(this.userForm.getRawValue())
+      .pipe(finalize(() => this.creatingUser.set(false)))
+      .subscribe({
+        next: user => {
+          this.createdUser.set(user);
+          this.refreshUsers(user.id);
+        },
+        error: (err: HttpErrorResponse) => this.error.set(apiError(err)),
+      });
   }
 
   submit() {
@@ -214,25 +306,25 @@ export class AppComponent {
       return;
     }
 
-    const payload: Timesheet = {
-      ...(this.form.getRawValue() as Omit<Timesheet, 'totalHours'>),
-      totalHours: this.grandTotal(),
+    const raw = this.form.getRawValue();
+    const payload: SubmitWeekRequest = {
+      user_id: raw.user_id!,
+      period_start: raw.period_start!,
+      period_end: addDays(raw.period_start!, 6),
+      entries: (raw.entries as CreateEntryRequest[]).map(e => ({
+        work_date: e.work_date,
+        hours: +e.hours || 0,
+        description: e.description ?? '',
+      })),
     };
 
     this.saving.set(true);
     this.api
-      .submit(payload)
+      .submitWeek(payload)
       .pipe(finalize(() => this.saving.set(false)))
       .subscribe({
         next: res => this.submitted.set(res),
-        error: (err: HttpErrorResponse) =>
-          this.error.set(
-            err.status === 0
-              ? "Can't reach the server. Check your connection and try again."
-              : err.status === 400 || err.status === 422
-                ? err.error?.message ?? 'The server rejected this timesheet. Check the entries and try again.'
-                : 'Something went wrong while saving. Try again in a moment.',
-          ),
+        error: (err: HttpErrorResponse) => this.error.set(apiError(err)),
       });
   }
 }

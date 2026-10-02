@@ -1,0 +1,18 @@
+{
+  "/users": {
+    "target": "http://localhost:5000",
+    "secure": false
+  },
+  "/timesheets": {
+    "target": "http://localhost:5000",
+    "secure": false
+  },
+  "/entries": {
+    "target": "http://localhost:5000",
+    "secure": false
+  },
+  "/health": {
+    "target": "http://localhost:5000",
+    "secure": false
+  }
+}
