@@ -1,7 +1,6 @@
 """Flask REST API for a timesheet system (users, timesheets, daily timesheet entries).
 
 Run:
-    pip install -r requirements.txt
     python app.py
 
 Use another database by setting DATABASE_URL, e.g.:
